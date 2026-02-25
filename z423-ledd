@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# 极空间 Z423 (飞牛 OS) 硬盘指示灯守护进程 (V6.1 绿灯常亮版)
+
+import time
+import os
+import re
+import subprocess
+
+PORT_CMD = 0x66
+PORT_DAT = 0x62
+
+# ==========================================
+# 功能开关
+# ==========================================
+ENABLE_IO_BLINK = False        # 设为 True 则开启绿灯随 IO 读写闪烁，默认 False 为常亮
+
+# ==========================================
+# 核心状态位
+# ==========================================
+LED_OFF = 0x00                 # 全灭
+LED_GREEN = 0x01               # 绿灯常亮 (正常闲置)
+LED_RED = 0x08                 # 红灯常亮 (硬盘故障)
+LED_YELLOW = 0x09              # 黄灯常亮 (阵列降级)
+LED_YELLOW_FAST_BLINK = 0x24   # 黄灯快闪 (阵列重建)
+
+# ==========================================
+# 备用/隐藏硬件特效
+# ==========================================
+LED_GREEN_SLOW_BLINK = 0x03    # 绿灯慢闪
+LED_GREEN_MED_BLINK = 0x04     # 绿灯中闪
+LED_GREEN_FAST_BLINK = 0x05    # 绿灯快闪
+LED_RED_SLOW_BLINK = 0x10      # 红灯慢闪
+LED_RED_MED_BLINK = 0x26       # 红灯中闪
+LED_RED_FAST_BLINK = 0x28      # 红灯快闪
+LED_YELLOW_GREEN_SLOW = 0x11   # 黄绿慢闪交替
+LED_YELLOW_GREEN_FAST = 0x21   # 黄绿快闪交替
+LED_MIX_FX_1 = 0x22            # 红灯快闪 + 黄绿快闪混合
+LED_MIX_FX_2 = 0x23            # 红灯特效2 + 黄绿特效2
+# ==========================================
+
+def write_ec(fd, addr, val):
+    try:
+        os.lseek(fd, PORT_CMD, os.SEEK_SET)
+        os.write(fd, b'\x81')
+        time.sleep(0.005)
+        os.lseek(fd, PORT_DAT, os.SEEK_SET)
+        os.write(fd, bytes([addr]))
+        time.sleep(0.005)
+        os.lseek(fd, PORT_DAT, os.SEEK_SET)
+        os.write(fd, bytes([val]))
+        time.sleep(0.005)
+    except Exception:
+        pass
+
+def get_dynamic_disk_map():
+    mapping = {}
+    if not os.path.exists('/sys/class/block'):
+        return mapping
+    for dev in os.listdir('/sys/class/block'):
+        if dev.startswith('sd') and not dev[-1].isdigit():
+            try:
+                path = os.readlink(os.path.join('/sys/class/block', dev))
+                if 'usb' in path:
+                    continue
+                match = re.search(r'/ata(\d+)/', path)
+                if match:
+                    ata_num = int(match.group(1))
+                    if 1 <= ata_num <= 4:
+                        mapping[dev] = 0x50 + ata_num
+                        continue
+                match_host = re.search(r'/host(\d+)/', path)
+                if match_host:
+                    host_num = int(match_host.group(1))
+                    if 0 <= host_num <= 3:
+                        mapping[dev] = 0x51 + host_num
+            except Exception:
+                pass
+    return mapping
+
+def get_io_stats(current_map):
+    io_state = {}
+    try:
+        with open('/proc/diskstats', 'r') as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 14:
+                    dev = parts[2]
+                    if dev in current_map:
+                        io_state[dev] = int(parts[3]) + int(parts[7])
+    except Exception:
+        pass
+    return io_state
+
+def check_disk_health(dev):
+    # 1. 物理层总线检查
+    state_file = f'/sys/block/{dev}/device/state'
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, 'r') as f:
+                if f.read().strip() != 'running':
+                    return 'fault'
+        except Exception:
+            pass
+
+    # 2. SMART 检测
+    try:
+        cmd = ['smartctl', '-n', 'standby', '-H', f'/dev/{dev}']
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode > 2:
+            return 'fault'
+    except Exception:
+        pass
+
+    # 3. ZFS 状态检测
+    try:
+        identifiers = [dev]
+        for disk_dir in ['/dev/disk/by-partuuid', '/dev/disk/by-uuid', '/dev/disk/by-id']:
+            if os.path.exists(disk_dir):
+                for item in os.listdir(disk_dir):
+                    try:
+                        target = os.path.basename(os.readlink(os.path.join(disk_dir, item)))
+                        if target.startswith(dev): 
+                            identifiers.append(item)
+                    except Exception:
+                        pass
+        
+        zpool_out = subprocess.check_output(['zpool', 'status'], text=True, stderr=subprocess.DEVNULL)
+        for line in zpool_out.split('\n'):
+            for ident in identifiers:
+                if ident in line:
+                    if 'resilvering' in line:
+                        return 'rebuilding'
+                    if 'FAULTED' in line or 'UNAVAIL' in line:
+                        return 'fault'
+                    if 'DEGRADED' in line:
+                        return 'degraded'
+    except Exception:
+        pass
+
+    # 4. 软 RAID 检测
+    try:
+        if os.path.exists('/proc/mdstat'):
+            with open('/proc/mdstat', 'r') as f:
+                mdstat = f.read()
+                if dev in mdstat:
+                    if 'recovery' in mdstat or 'resync' in mdstat:
+                        return 'rebuilding'
+                    if '_U' in mdstat or 'U_' in mdstat:
+                        return 'degraded'
+    except Exception:
+        pass
+
+    return 'normal'
+
+def main():
+    fd = os.open('/dev/port', os.O_RDWR)
+    led_addrs = [0x51, 0x52, 0x53, 0x54]
+    current_led_state = {}
+    
+    # 开机自检
+    for addr in led_addrs:
+        write_ec(fd, addr, LED_RED_FAST_BLINK)
+        current_led_state[addr] = LED_RED_FAST_BLINK
+    time.sleep(2)
+        
+    last_io = {}
+    disk_health = {}
+    last_health_check_time = 0
+    
+    while True:
+        current_time = time.time()
+        disk_map = get_dynamic_disk_map()
+        
+        if current_time - last_health_check_time > 60:
+            for dev in disk_map.keys():
+                disk_health[dev] = check_disk_health(dev)
+            last_health_check_time = current_time
+
+        curr_io = get_io_stats(disk_map)
+        active_addrs = []
+        
+        for addr in led_addrs:
+            dev_for_addr = None
+            for dev, mapped_addr in disk_map.items():
+                if mapped_addr == addr:
+                    dev_for_addr = dev
+                    break
+            
+            if not dev_for_addr or dev_for_addr not in curr_io:
+                if current_led_state.get(addr) != LED_OFF:
+                    write_ec(fd, addr, LED_OFF)
+                    current_led_state[addr] = LED_OFF
+            else:
+                dev = dev_for_addr
+                health = disk_health.get(dev, 'normal')
+                
+                if health == 'fault':
+                    if current_led_state.get(addr) != LED_RED:
+                        write_ec(fd, addr, LED_RED)
+                        current_led_state[addr] = LED_RED
+                        
+                elif health == 'degraded':
+                    if current_led_state.get(addr) != LED_YELLOW:
+                        write_ec(fd, addr, LED_YELLOW)
+                        current_led_state[addr] = LED_YELLOW
+                        
+                elif health == 'rebuilding':
+                    if current_led_state.get(addr) != LED_YELLOW_FAST_BLINK:
+                        write_ec(fd, addr, LED_YELLOW_FAST_BLINK)
+                        current_led_state[addr] = LED_YELLOW_FAST_BLINK
+                        
+                else:
+                    # 正常状态：根据 ENABLE_IO_BLINK 判断是否记录活跃 IO
+                    if ENABLE_IO_BLINK and dev in last_io and curr_io[dev] != last_io[dev]:
+                        active_addrs.append(addr)
+                    else:
+                        if current_led_state.get(addr) != LED_GREEN:
+                            write_ec(fd, addr, LED_GREEN)
+                            current_led_state[addr] = LED_GREEN
+                        
+        # 执行 IO 闪烁
+        if active_addrs:
+            for addr in active_addrs:
+                write_ec(fd, addr, LED_OFF)
+            time.sleep(0.05)
+            for addr in active_addrs:
+                write_ec(fd, addr, LED_GREEN)
+                current_led_state[addr] = LED_GREEN
+                
+        last_io = curr_io
+        time.sleep(0.2)
+
+if __name__ == '__main__':
+    main()

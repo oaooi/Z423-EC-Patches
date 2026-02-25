@@ -1,0 +1,50 @@
+#!/bin/sh
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+
+case "$1" in
+  prereqs) prereqs; exit 0 ;;
+esac
+
+# best-effort load (may differ by initramfs version)
+[ -r /scripts/functions ] && . /scripts/functions
+
+klog() {
+  echo "[z423_hw_init] $*"
+  [ -w /dev/kmsg ] && echo "<6>[z423_hw_init] $*" > /dev/kmsg
+}
+
+klog "start (init-top)"
+
+# /dev/port must exist
+if [ ! -e /dev/port ]; then
+  klog "/dev/port not present; skipping"
+  exit 0
+fi
+
+if command -v busybox >/dev/null 2>&1; then BB=busybox; else BB=""; fi
+dd_cmd() { ${BB:-} dd "$@"; }
+sleep_cmd() { ${BB:-} sleep "$@"; }
+
+write_ec() {
+  addr="${1#0x}"
+  value="${2#0x}"
+  printf "\x81" | dd_cmd of=/dev/port bs=1 seek=$((0x66)) count=1 conv=notrunc status=none
+  sleep_cmd 0.05
+  printf "\x${addr}" | dd_cmd of=/dev/port bs=1 seek=$((0x62)) count=1 conv=notrunc status=none
+  sleep_cmd 0.05
+  printf "\x${value}" | dd_cmd of=/dev/port bs=1 seek=$((0x62)) count=1 conv=notrunc status=none
+  sleep_cmd 0.05
+}
+
+klog "Fan Control: write 0x59=0x0b"
+write_ec "0x59" "0x0b"
+sleep_cmd 1
+
+klog "SATA Control: write 0x58=0xff"
+write_ec "0x58" "0xff"
+sleep_cmd 5
+
+klog "done"
+exit 0

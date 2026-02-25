@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Z423 智能温控守护进程
+
+import time
+import os
+import subprocess
+import fcntl
+
+# ==========================================
+# 1. 风扇控制模式
+# 'HW_AUTO'  : 硬件原生温控 (主板接管，最安全，不再下发PWM)
+# 'SW_CURVE' : 软件动态曲线 (脚本接管，最灵活)
+# 'SW_FIXED' : 软件固定转速 (脚本接管，恒定噪音)
+# ==========================================
+CPU_FAN_MODE = 'SW_CURVE'
+SYS_FAN_MODE = 'SW_CURVE'     # 例如：让机箱风扇恢复原厂硬件自动
+
+# ==========================================
+# 2. 软件温控配置 (仅在 SW_CURVE 或 SW_FIXED 下生效)
+# ==========================================
+# CPU 策略
+CPU_MIN_TEMP = 45   
+CPU_MAX_TEMP = 90   
+CPU_MIN_PWM = 20
+CPU_FIXED_PWM = 40
+
+# 机箱/硬盘策略
+SYS_MIN_TEMP = 35   
+SYS_MAX_TEMP = 45   
+SYS_MIN_PWM = 25
+SYS_FIXED_PWM = 40
+
+# ==========================================
+# 3. 硬件底层寄存器
+# ==========================================
+PORT_CMD = 0x66
+PORT_DAT = 0x62
+REG_CTRL = 0x59    
+REG_SYS_PWM = 0x5C 
+REG_CPU_PWM = 0x69 
+
+REG_SYS_RPM_H = 0x5E
+REG_SYS_RPM_L = 0x5F
+REG_CPU_RPM_H = 0x6B
+REG_CPU_RPM_L = 0x6C
+
+# 权限分离位掩码 (Bitmask)
+BIT_WDG = 0x08       # 看门狗必须常开
+BIT_SYS_AUTO = 0x01  # 猜测：0x01 为机箱风扇硬件自动权限 (如果发现反了，请与 CPU 互换)
+BIT_CPU_AUTO = 0x02  # 猜测：0x02 为 CPU 风扇硬件自动权限
+
+LOCK_FILE = '/tmp/z423_ec_port.lock'
+
+def acquire_lock():
+    fd = open(LOCK_FILE, 'w')
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+def release_lock(fd):
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    fd.close()
+
+def write_ec(port_fd, addr, val):
+    lock_fd = acquire_lock()
+    try:
+        os.lseek(port_fd, PORT_CMD, os.SEEK_SET)
+        os.write(port_fd, b'\x81')
+        time.sleep(0.005)
+        os.lseek(port_fd, PORT_DAT, os.SEEK_SET)
+        os.write(port_fd, bytes([addr]))
+        time.sleep(0.005)
+        os.lseek(port_fd, PORT_DAT, os.SEEK_SET)
+        os.write(port_fd, bytes([val]))
+        time.sleep(0.005)
+    except Exception:
+        pass
+    finally:
+        release_lock(lock_fd)
+
+def read_ec(port_fd, addr):
+    lock_fd = acquire_lock()
+    try:
+        os.lseek(port_fd, PORT_CMD, os.SEEK_SET)
+        os.write(port_fd, b'\x80')
+        time.sleep(0.005)
+        os.lseek(port_fd, PORT_DAT, os.SEEK_SET)
+        os.write(port_fd, bytes([addr]))
+        time.sleep(0.005)
+        os.lseek(port_fd, PORT_DAT, os.SEEK_SET)
+        val = os.read(port_fd, 1)
+        return ord(val) if val else 0
+    except Exception:
+        return 0
+    finally:
+        release_lock(lock_fd)
+
+def get_fan_rpm(port_fd, addr_h, addr_l):
+    val_h = read_ec(port_fd, addr_h)
+    val_l = read_ec(port_fd, addr_l)
+    rpm = (val_h << 8) | val_l
+    return rpm if rpm < 10000 else 0 
+
+def get_cpu_temp():
+    # 动态寻找 AMD k10temp 传感器
+    try:
+        for i in range(20): # 扩大搜索范围
+            name_path = f'/sys/class/hwmon/hwmon{i}/name'
+            if os.path.exists(name_path):
+                with open(name_path, 'r') as f:
+                    if 'k10temp' in f.read():
+                        # 读取该目录下的 temp1_input (Tctl 温度)
+                        temp_path = f'/sys/class/hwmon/hwmon{i}/temp1_input'
+                        if os.path.exists(temp_path):
+                            with open(temp_path, 'r') as f_t:
+                                return int(f_t.read()) / 1000
+    except Exception:
+        pass
+    return 50 # 兜底值
+
+def get_max_hdd_temp():
+    max_temp = 35
+    try:
+        output = subprocess.check_output("smartctl --scan", shell=True, text=True)
+        for line in output.splitlines():
+            dev = line.split()[0]
+            if '/dev/nvme' in dev: 
+                continue
+            res = subprocess.check_output(f"smartctl -A {dev}", shell=True, text=True)
+            for l in res.splitlines():
+                if "Temperature_Celsius" in l or "Airflow_Temperature" in l:
+                    temp = int(l.split()[9])
+                    if temp > max_temp: max_temp = temp
+    except Exception: 
+        pass
+    return max_temp
+
+def calc_pwm(temp, min_t, max_t, min_pwm):
+    if temp <= min_t: return min_pwm
+    if temp >= max_t: return 100
+    return int(min_pwm + (100 - min_pwm) * (temp - min_t) / (max_t - min_t))
+
+def main():
+    port_fd = os.open('/dev/port', os.O_RDWR)
+    print("Z423 Fan Daemon Started.", flush=True)
+    
+    try:
+        while True:
+            # 1. 动态生成控制权限位 (拼装 0x59 寄存器的指令)
+            ctrl_val = BIT_WDG
+            if CPU_FAN_MODE == 'HW_AUTO':
+                ctrl_val |= BIT_CPU_AUTO
+            if SYS_FAN_MODE == 'HW_AUTO':
+                ctrl_val |= BIT_SYS_AUTO
+                
+            write_ec(port_fd, REG_CTRL, ctrl_val)
+            
+            # 2. 读取当前温度
+            cpu_t = get_cpu_temp()
+            hdd_t = get_max_hdd_temp()
+            
+            # 3. CPU 风扇逻辑
+            if CPU_FAN_MODE == 'SW_CURVE':
+                cpu_pwm = calc_pwm(cpu_t, CPU_MIN_TEMP, CPU_MAX_TEMP, CPU_MIN_PWM)
+                write_ec(port_fd, REG_CPU_PWM, cpu_pwm)
+                cpu_info = f"[SW_CURVE: {cpu_pwm:3d}%]"
+            elif CPU_FAN_MODE == 'SW_FIXED':
+                cpu_pwm = CPU_FIXED_PWM
+                write_ec(port_fd, REG_CPU_PWM, cpu_pwm)
+                cpu_info = f"[SW_FIXED: {cpu_pwm:3d}%]"
+            else:
+                cpu_info = "[HW_AUTO:  EC%]"
+
+            # 4. 机箱/硬盘风扇逻辑
+            if SYS_FAN_MODE == 'SW_CURVE':
+                sys_pwm = calc_pwm(hdd_t, SYS_MIN_TEMP, SYS_MAX_TEMP, SYS_MIN_PWM)
+                write_ec(port_fd, REG_SYS_PWM, sys_pwm)
+                sys_info = f"[SW_CURVE: {sys_pwm:3d}%]"
+            elif SYS_FAN_MODE == 'SW_FIXED':
+                sys_pwm = SYS_FIXED_PWM
+                write_ec(port_fd, REG_SYS_PWM, sys_pwm)
+                sys_info = f"[SW_FIXED: {sys_pwm:3d}%]"
+            else:
+                sys_info = "[HW_AUTO:  EC%]"
+            
+            # 5. 读取真实转速
+            cpu_rpm = get_fan_rpm(port_fd, REG_CPU_RPM_H, REG_CPU_RPM_L)
+            sys_rpm = get_fan_rpm(port_fd, REG_SYS_RPM_H, REG_SYS_RPM_L)
+            
+            # 输出极其直观的日志
+            print(f"CPU: {cpu_t:2.0f}°C {cpu_info} -> {cpu_rpm:4d} RPM | "
+                  f"HDD: {hdd_t:2d}°C {sys_info} -> {sys_rpm:4d} RPM", flush=True)
+            
+            time.sleep(10) 
+            
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # 安全退出机制：无条件恢复原厂纯硬件控制 (即 0x0b)，确保系统不崩
+        write_ec(port_fd, REG_CTRL, BIT_WDG | BIT_CPU_AUTO | BIT_SYS_AUTO)
+        os.close(port_fd)
+        print("Daemon Stopped. Full Control returned to EC Hardware.", flush=True)
+
+if __name__ == '__main__':
+    main()

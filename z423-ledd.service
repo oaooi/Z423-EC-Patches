@@ -1,0 +1,14 @@
+[Unit]
+Description=Zspace Z423 HDD LED Monitor
+After=local-fs.target
+
+[Service]
+Type=simple
+# 确保这里指向你的 Python 执行路径和脚本所在的准确位置
+ExecStart=/usr/bin/python3 /usr/local/sbin/z423-ledd
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
