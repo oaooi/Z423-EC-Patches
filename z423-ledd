@@ -40,17 +40,28 @@ LED_MIX_FX_2 = 0x23            # 红灯特效2 + 黄绿特效2
 # ==========================================
 
 def write_ec(fd, addr, val):
+    # 使用统一的锁文件，确保与风扇脚本互斥
+    lock_file = '/tmp/z423_ec_port.lock'
     try:
-        os.lseek(fd, PORT_CMD, os.SEEK_SET)
-        os.write(fd, b'\x81')
-        time.sleep(0.005)
-        os.lseek(fd, PORT_DAT, os.SEEK_SET)
-        os.write(fd, bytes([addr]))
-        time.sleep(0.005)
-        os.lseek(fd, PORT_DAT, os.SEEK_SET)
-        os.write(fd, bytes([val]))
-        time.sleep(0.005)
+        # 以写模式打开（如果不存在则创建）
+        with open(lock_file, 'w') as f_lock:
+            # 阻塞式排他锁
+            fcntl.flock(f_lock, fcntl.LOCK_EX)
+            try:
+                os.lseek(fd, PORT_CMD, os.SEEK_SET)
+                os.write(fd, b'\x81')
+                time.sleep(0.005)
+                os.lseek(fd, PORT_DAT, os.SEEK_SET)
+                os.write(fd, bytes([addr]))
+                time.sleep(0.005)
+                os.lseek(fd, PORT_DAT, os.SEEK_SET)
+                os.write(fd, bytes([val]))
+                time.sleep(0.005)
+            finally:
+                # 无论写入成功与否，必须解锁
+                fcntl.flock(f_lock, fcntl.LOCK_UN)
     except Exception:
+        # 即使锁操作失败也保持静默，不中断主循环
         pass
 
 def get_dynamic_disk_map():
