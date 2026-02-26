@@ -14,7 +14,7 @@ PORT_DAT = 0x62
 # ==========================================
 # 功能开关
 # ==========================================
-ENABLE_IO_BLINK = False        # 设为 True 则开启绿灯随 IO 读写闪烁，默认 False 为常亮
+ENABLE_IO_BLINK = False        # True: 绿灯随 IO 读写闪烁；False: 正常盘绿灯常亮
 
 # ==========================================
 # 核心状态位
@@ -40,6 +40,11 @@ LED_MIX_FX_1 = 0x22            # 红灯快闪 + 黄绿快闪混合
 LED_MIX_FX_2 = 0x23            # 红灯特效2 + 黄绿特效2
 # ==========================================
 
+# 外部命令超时（秒）：防止 smartctl/zpool 在异常场景卡死导致主循环停摆
+SMARTCTL_TIMEOUT = 3
+ZPOOL_TIMEOUT = 3
+
+
 def write_ec(fd, addr, val):
     lock_file = '/tmp/z423_ec_port.lock'
     try:
@@ -61,6 +66,7 @@ def write_ec(fd, addr, val):
                 fcntl.flock(f_lock, fcntl.LOCK_UN)
     except Exception:
         pass
+
 
 def get_dynamic_disk_map():
     mapping = {}
@@ -87,6 +93,7 @@ def get_dynamic_disk_map():
                 pass
     return mapping
 
+
 def get_io_stats(current_map):
     io_state = {}
     try:
@@ -101,8 +108,9 @@ def get_io_stats(current_map):
         pass
     return io_state
 
+
 def check_disk_health(dev):
-    # 1. 物理层总线检查
+    # 1) 物理层总线检查
     state_file = f'/sys/block/{dev}/device/state'
     if os.path.exists(state_file):
         try:
@@ -112,16 +120,25 @@ def check_disk_health(dev):
         except Exception:
             pass
 
-    # 2. SMART 检测
+    # 2) SMART 检测
     try:
         cmd = ['smartctl', '-n', 'standby', '-H', f'/dev/{dev}']
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=SMARTCTL_TIMEOUT,
+        )
+        # smartctl 返回码语义较复杂；这里沿用你原策略：>2 认为异常
         if result.returncode > 2:
             return 'fault'
+    except subprocess.TimeoutExpired:
+        # 超时不直接判故障，避免误报；交给后续巡检再确认
+        pass
     except Exception:
         pass
 
-    # 3. ZFS 状态检测
+    # 3) ZFS 状态检测
     try:
         identifiers = [dev]
         for disk_dir in ['/dev/disk/by-partuuid', '/dev/disk/by-uuid', '/dev/disk/by-id']:
@@ -129,12 +146,17 @@ def check_disk_health(dev):
                 for item in os.listdir(disk_dir):
                     try:
                         target = os.path.basename(os.readlink(os.path.join(disk_dir, item)))
-                        if target.startswith(dev): 
+                        if target.startswith(dev):
                             identifiers.append(item)
                     except Exception:
                         pass
-        
-        zpool_out = subprocess.check_output(['zpool', 'status'], text=True, stderr=subprocess.DEVNULL)
+
+        zpool_out = subprocess.check_output(
+            ['zpool', 'status'],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=ZPOOL_TIMEOUT,
+        )
         for line in zpool_out.split('\n'):
             for ident in identifiers:
                 if ident in line:
@@ -144,10 +166,12 @@ def check_disk_health(dev):
                         return 'fault'
                     if 'DEGRADED' in line:
                         return 'degraded'
+    except subprocess.TimeoutExpired:
+        pass
     except Exception:
         pass
 
-    # 4. 软 RAID 检测
+    # 4) 软 RAID 检测
     try:
         if os.path.exists('/proc/mdstat'):
             with open('/proc/mdstat', 'r') as f:
@@ -162,63 +186,83 @@ def check_disk_health(dev):
 
     return 'normal'
 
+
 def main():
     fd = os.open('/dev/port', os.O_RDWR)
     led_addrs = [0x51, 0x52, 0x53, 0x54]
     current_led_state = {}
-    
-    # 开机自检
+
+    # ���机自检
     for addr in led_addrs:
         write_ec(fd, addr, LED_RED_FAST_BLINK)
         current_led_state[addr] = LED_RED_FAST_BLINK
     time.sleep(2)
-        
+
     last_io = {}
     disk_health = {}
     last_health_check_time = 0
-    
+
     while True:
         current_time = time.time()
         disk_map = get_dynamic_disk_map()
-        
-        if current_time - last_health_check_time > 60:
+
+        # ================= 硬盘热插拔即时处理逻辑 =================
+        # 1) 清理已拔出的硬盘缓存
+        for dev in list(disk_health.keys()):
+            if dev not in disk_map:
+                disk_health.pop(dev, None)
+                last_io.pop(dev, None)
+
+        # 2) 新插入硬盘：立刻进行一次“入职体检”
+        did_instant_check = False
+        for dev in disk_map.keys():
+            if dev not in disk_health:
+                disk_health[dev] = check_disk_health(dev)
+                did_instant_check = True
+
+        # 3) 60 秒定期全局巡检（检测运行中途坏掉的盘）
+        if did_instant_check:
+            # 如果刚做过新盘体检，重置 60 秒倒计时，避免下一轮(0.2s后)立刻触发全盘扫描
+            last_health_check_time = current_time
+        elif current_time - last_health_check_time > 60:
             for dev in disk_map.keys():
                 disk_health[dev] = check_disk_health(dev)
             last_health_check_time = current_time
+        # ==========================================================
 
         curr_io = get_io_stats(disk_map)
         active_addrs = []
-        
+
         for addr in led_addrs:
             dev_for_addr = None
             for dev, mapped_addr in disk_map.items():
                 if mapped_addr == addr:
                     dev_for_addr = dev
                     break
-            
+
             if not dev_for_addr or dev_for_addr not in curr_io:
                 if current_led_state.get(addr) != LED_OFF:
                     write_ec(fd, addr, LED_OFF)
                     current_led_state[addr] = LED_OFF
             else:
                 dev = dev_for_addr
-                health = disk_health.get(dev, 'normal')
-                
+                health = disk_health.get(dev, 'normal')  # 兜底：理论上此时应已存在
+
                 if health == 'fault':
                     if current_led_state.get(addr) != LED_RED:
                         write_ec(fd, addr, LED_RED)
                         current_led_state[addr] = LED_RED
-                        
+
                 elif health == 'degraded':
                     if current_led_state.get(addr) != LED_YELLOW:
                         write_ec(fd, addr, LED_YELLOW)
                         current_led_state[addr] = LED_YELLOW
-                        
+
                 elif health == 'rebuilding':
                     if current_led_state.get(addr) != LED_YELLOW_FAST_BLINK:
                         write_ec(fd, addr, LED_YELLOW_FAST_BLINK)
                         current_led_state[addr] = LED_YELLOW_FAST_BLINK
-                        
+
                 else:
                     # 正常状态：根据 ENABLE_IO_BLINK 判断是否记录活跃 IO
                     if ENABLE_IO_BLINK and dev in last_io and curr_io[dev] != last_io[dev]:
@@ -227,7 +271,7 @@ def main():
                         if current_led_state.get(addr) != LED_GREEN:
                             write_ec(fd, addr, LED_GREEN)
                             current_led_state[addr] = LED_GREEN
-                        
+
         # 执行 IO 闪烁
         if active_addrs:
             for addr in active_addrs:
@@ -236,9 +280,10 @@ def main():
             for addr in active_addrs:
                 write_ec(fd, addr, LED_GREEN)
                 current_led_state[addr] = LED_GREEN
-                
+
         last_io = curr_io
         time.sleep(0.2)
+
 
 if __name__ == '__main__':
     main()
