@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 极空间 Z423 (飞牛 OS) 硬盘指示灯守护进程 (V6.1 绿灯常亮版)
+# 极空间 Z423 硬盘指示灯守护进程
 
 import time
 import os
 import re
 import subprocess
+import fcntl
 
 PORT_CMD = 0x66
 PORT_DAT = 0x62
@@ -40,12 +41,10 @@ LED_MIX_FX_2 = 0x23            # 红灯特效2 + 黄绿特效2
 # ==========================================
 
 def write_ec(fd, addr, val):
-    # 使用统一的锁文件，确保与风扇脚本互斥
     lock_file = '/tmp/z423_ec_port.lock'
     try:
-        # 以写模式打开（如果不存在则创建）
+        # 申请排他锁，如果风扇脚本正在用，这里会自动等待，绝不撞车
         with open(lock_file, 'w') as f_lock:
-            # 阻塞式排他锁
             fcntl.flock(f_lock, fcntl.LOCK_EX)
             try:
                 os.lseek(fd, PORT_CMD, os.SEEK_SET)
@@ -58,10 +57,9 @@ def write_ec(fd, addr, val):
                 os.write(fd, bytes([val]))
                 time.sleep(0.005)
             finally:
-                # 无论写入成功与否，必须解锁
+                # 硬件操作完成，释放锁
                 fcntl.flock(f_lock, fcntl.LOCK_UN)
     except Exception:
-        # 即使锁操作失败也保持静默，不中断主循环
         pass
 
 def get_dynamic_disk_map():
