@@ -27,15 +27,51 @@ if command -v busybox >/dev/null 2>&1; then BB=busybox; else BB=""; fi
 dd_cmd() { ${BB:-} dd "$@"; }
 sleep_cmd() { ${BB:-} sleep "$@"; }
 
+# Read EC status byte from port 0x66
+ec_status_u8() {
+  # od 输出可能有前导空格，这里用 tr 去掉空白
+  dd_cmd if=/dev/port bs=1 skip=$((0x66)) count=1 status=none 2>/dev/null \
+    | od -An -tu1 2>/dev/null | tr -d ' \n\t'
+}
+
+wait_ec() {
+  # Wait until IBF(bit1) cleared. Add timeout to avoid infinite hang.
+  # timeout uses a simple loop counter with small sleeps to avoid requiring date/timeout tool.
+  # 200 * 0.005s ≈ 1s
+  i=0
+  while :; do
+    s="$(ec_status_u8)"
+    case "$s" in
+      ''|*[!0-9]*) s=255 ;;  # 读失败时当成 busy
+    esac
+
+    # 如果 (s & 2) == 0 则可写
+    if [ $((s & 2)) -eq 0 ]; then
+      return 0
+    fi
+
+    i=$((i + 1))
+    if [ "$i" -ge 200 ]; then
+      # 超时：记录一下，但仍返回失败让上层决定是否继续
+      klog "wait_ec timeout, status=$s"
+      return 1
+    fi
+    sleep_cmd 0.005
+  done
+}
+
 write_ec() {
   addr="${1#0x}"
   value="${2#0x}"
-  printf "\x81" | dd_cmd of=/dev/port bs=1 seek=$((0x66)) count=1 conv=notrunc status=none
-  sleep_cmd 0.05
-  printf "\x${addr}" | dd_cmd of=/dev/port bs=1 seek=$((0x62)) count=1 conv=notrunc status=none
-  sleep_cmd 0.05
-  printf "\x${value}" | dd_cmd of=/dev/port bs=1 seek=$((0x62)) count=1 conv=notrunc status=none
-  sleep_cmd 0.05
+
+  wait_ec || true
+  printf "\x81" | dd_cmd of=/dev/port bs=1 seek=$((0x66)) count=1 conv=notrunc status=none 2>/dev/null
+
+  wait_ec || true
+  printf "\x${addr}" | dd_cmd of=/dev/port bs=1 seek=$((0x62)) count=1 conv=notrunc status=none 2>/dev/null
+
+  wait_ec || true
+  printf "\x${value}" | dd_cmd of=/dev/port bs=1 seek=$((0x62)) count=1 conv=notrunc status=none 2>/dev/null
 }
 
 klog "Move EC Control to Linux"
