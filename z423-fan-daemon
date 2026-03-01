@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Z423 智能温控守护进程
+#
+# 关键安全策略：
+# 1) 绝不“覆盖写”0x59；只在启动/退出时对 0x59 做读-改-写，并且只保证 bit3(0x08) 常开（官方 set_ec_kern_ctrl_mode 行为）
+# 2) 不再猜测 0x01/0x02 是风扇自动位。根据反汇编，它们分别是 NVMe/USB 供电开关，绝不触碰。
+# 3) 风扇控制仅写 PWM 寄存器：SYS=0x5C，CPU=0x69；RPM 读取：SYS=0x5E/0x5F，CPU=0x6B/0x6C
+# 4) 磁盘温度不使用 smartctl，改读 drivetemp hwmon（内核导出），避免 smartctl 卡住导致系统不稳
+# 5) EC 端口访问使用同一把 flock 锁，并加入锁超时，避免与其他脚本互相卡死
+# 6) PWM 写入做“变化阈值”限制（默认 >=2% 才写），减少 EC 写入频率
 
 import time
 import os
 import fcntl
+from typing import Optional
 
-# ==========================================
-# 1. 风扇控制模式
-# ==========================================
+# ============ 配置 ============
 CPU_FAN_MODE = 'SW_CURVE'   # 'HW_AUTO' | 'SW_CURVE' | 'SW_FIXED'
 SYS_FAN_MODE = 'SW_CURVE'   # 'HW_AUTO' | 'SW_CURVE' | 'SW_FIXED'
 
-# ==========================================
-# 2. 软件温控配置 (仅在 SW_CURVE 或 SW_FIXED 下生效)
-# ==========================================
 CPU_MIN_TEMP = 45
 CPU_MAX_TEMP = 90
 CPU_MIN_PWM = 20
@@ -25,11 +29,15 @@ SYS_MAX_TEMP = 45
 SYS_MIN_PWM = 25
 SYS_FIXED_PWM = 40
 
-# ==========================================
-# 3. 硬件底层寄存器
-# ==========================================
+MAIN_INTERVAL_SEC = 10
+
+# PWM 变化阈值：小于该阈值就不写 EC，减少写入次数
+PWM_WRITE_DELTA = 2
+
+# ============ EC 寄存器/端口 ============
 PORT_CMD = 0x66
 PORT_DAT = 0x62
+
 REG_CTRL = 0x59
 REG_SYS_PWM = 0x5C
 REG_CPU_PWM = 0x69
@@ -39,18 +47,15 @@ REG_SYS_RPM_L = 0x5F
 REG_CPU_RPM_H = 0x6B
 REG_CPU_RPM_L = 0x6C
 
-# 权限分离位掩码 (Bitmask)
+# 参照官方：0x59 至少要保证 bit3 常开
 BIT_WDG = 0x08
-BIT_SYS_AUTO = 0x01
-BIT_CPU_AUTO = 0x02
 
 LOCK_FILE = '/tmp/z423_ec_port.lock'
-
-# 锁等待上限，避免别的脚本异常持锁导致本进程永远阻塞
 LOCK_TIMEOUT_SEC = 2.0
 LOCK_RETRY_SLEEP = 0.01
 
 
+# ============ 锁 ============
 def acquire_lock():
     start = time.time()
     fd = open(LOCK_FILE, 'a')
@@ -72,59 +77,64 @@ def release_lock(fd):
         fd.close()
 
 
-def write_ec(port_fd, addr, val):
+# ============ EC 访问（/dev/port 0x66/0x62 协议） ============
+def write_ec(port_fd: int, addr: int, val: int) -> bool:
     try:
         lock_fd = acquire_lock()
     except Exception:
-        return
+        return False
     try:
         os.lseek(port_fd, PORT_CMD, os.SEEK_SET)
-        os.write(port_fd, b'\x81')
+        os.write(port_fd, b'\x81')  # write
         time.sleep(0.005)
         os.lseek(port_fd, PORT_DAT, os.SEEK_SET)
-        os.write(port_fd, bytes([addr]))
+        os.write(port_fd, bytes([addr & 0xFF]))
         time.sleep(0.005)
         os.lseek(port_fd, PORT_DAT, os.SEEK_SET)
-        os.write(port_fd, bytes([val]))
+        os.write(port_fd, bytes([val & 0xFF]))
         time.sleep(0.005)
+        return True
     except Exception:
-        pass
+        return False
     finally:
         release_lock(lock_fd)
 
 
-def read_ec(port_fd, addr):
+def read_ec(port_fd: int, addr: int) -> Optional[int]:
     try:
         lock_fd = acquire_lock()
     except Exception:
-        return 0
+        return None
     try:
         os.lseek(port_fd, PORT_CMD, os.SEEK_SET)
-        os.write(port_fd, b'\x80')
+        os.write(port_fd, b'\x80')  # read
         time.sleep(0.005)
         os.lseek(port_fd, PORT_DAT, os.SEEK_SET)
-        os.write(port_fd, bytes([addr]))
+        os.write(port_fd, bytes([addr & 0xFF]))
         time.sleep(0.005)
         os.lseek(port_fd, PORT_DAT, os.SEEK_SET)
         val = os.read(port_fd, 1)
-        return val[0] if val else 0
+        return val[0] if val else None
     except Exception:
-        return 0
+        return None
     finally:
         release_lock(lock_fd)
 
 
-def get_fan_rpm(port_fd, addr_h, addr_l):
-    val_h = read_ec(port_fd, addr_h)
-    val_l = read_ec(port_fd, addr_l)
-    rpm = (val_h << 8) | val_l
+def get_fan_rpm(port_fd: int, addr_h: int, addr_l: int) -> int:
+    vh = read_ec(port_fd, addr_h)
+    vl = read_ec(port_fd, addr_l)
+    if vh is None or vl is None:
+        return 0
+    rpm = (vh << 8) | vl
     return rpm if rpm < 10000 else 0
 
 
-def get_cpu_temp():
-    # 动态寻找 AMD k10temp 传感器
+# ============ 温度读取 ============
+def get_cpu_temp() -> float:
+    # 动态寻找 AMD k10temp 传感器（沿用你原逻辑）
     try:
-        for i in range(40):
+        for i in range(60):
             name_path = f'/sys/class/hwmon/hwmon{i}/name'
             if os.path.exists(name_path):
                 with open(name_path, 'r') as f:
@@ -132,32 +142,28 @@ def get_cpu_temp():
                         temp_path = f'/sys/class/hwmon/hwmon{i}/temp1_input'
                         if os.path.exists(temp_path):
                             with open(temp_path, 'r') as f_t:
-                                return int(f_t.read()) / 1000.0
+                                return int(f_t.read().strip()) / 1000.0
     except Exception:
         pass
     return 50.0
 
 
-def _read_temp_input(path):
-    # hwmon temp*_input 单位通常是毫摄氏度
+def _read_temp_input(path: str) -> Optional[float]:
     try:
         with open(path, 'r') as f:
             v = int(f.read().strip())
-        if v > 1000:
-            return v / 1000.0
-        return float(v)
+        # hwmon temp*_input 通常为毫摄氏度
+        return v / 1000.0 if v > 1000 else float(v)
     except Exception:
         return None
 
 
-def get_max_drive_temp_from_drivetemp():
+def get_max_drive_temp_from_drivetemp() -> float:
     """
-    从内核 drivetemp hwmon 读取硬盘温度（不调用 smartctl）。
-    兼容你截图里的:
-      /sys/class/hwmon/hwmonX/name == 'drivetemp_scsi_3_0' (或类似)
-    取所有 drivetemp* 的 temp*_input 最大值作为 HDD 温度。
+    从 /sys/class/hwmon/*/name == drivetemp* 读取所有 temp*_input 的最大值。
+    参照你截图里的 drivetemp-scsi-*-0。
     """
-    max_temp = None
+    max_temp: Optional[float] = None
     hwmon_root = '/sys/class/hwmon'
     try:
         for entry in os.listdir(hwmon_root):
@@ -166,28 +172,26 @@ def get_max_drive_temp_from_drivetemp():
                 continue
             with open(name_path, 'r') as f:
                 name = f.read().strip().lower()
-
-            # 常见命名：drivetemp_scsi_3_0 / drivetemp-scsi-3-0（显示层不同）
             if not name.startswith('drivetemp'):
                 continue
 
-            # 扫 temp1_input, temp2_input...
             base = os.path.join(hwmon_root, entry)
             for fn in os.listdir(base):
                 if fn.startswith('temp') and fn.endswith('_input'):
                     t = _read_temp_input(os.path.join(base, fn))
                     if t is None:
                         continue
-                    if (max_temp is None) or (t > max_temp):
+                    if max_temp is None or t > max_temp:
                         max_temp = t
     except Exception:
         pass
 
-    # 兜底：没有 drivetemp 就给个保守值，避免风扇过低
+    # 兜底：没找到 drivetemp，给保守温度
     return max_temp if max_temp is not None else 40.0
 
 
-def calc_pwm(temp, min_t, max_t, min_pwm):
+# ============ 控制逻辑 ============
+def calc_pwm(temp: float, min_t: float, max_t: float, min_pwm: int) -> int:
     if temp <= min_t:
         return int(min_pwm)
     if temp >= max_t:
@@ -195,61 +199,72 @@ def calc_pwm(temp, min_t, max_t, min_pwm):
     return int(min_pwm + (100 - min_pwm) * (temp - min_t) / (max_t - min_t))
 
 
-def calc_ctrl_val():
-    ctrl_val = BIT_WDG
-    if CPU_FAN_MODE == 'HW_AUTO':
-        ctrl_val |= BIT_CPU_AUTO
-    if SYS_FAN_MODE == 'HW_AUTO':
-        ctrl_val |= BIT_SYS_AUTO
-    return ctrl_val
+def ensure_reg59_wdg_set(port_fd: int) -> bool:
+    """
+    参照官方 set_ec_kern_ctrl_mode：
+    read 0x59 -> OR 0x08 -> write back 0x59
+    只保证 bit3 置位，不清除/不覆盖其它位。
+    """
+    old = read_ec(port_fd, REG_CTRL)
+    if old is None:
+        return False
+    new = old | BIT_WDG
+    if new == old:
+        return True
+    return write_ec(port_fd, REG_CTRL, new)
+
+
+def maybe_write_pwm(port_fd: int, reg: int, new_pwm: int, last_pwm: Optional[int]) -> int:
+    """
+    PWM 写入节流：只有变化 >= PWM_WRITE_DELTA 才写。
+    返回更新后的 last_pwm（写成功也更新；写失败则仍更新为 new_pwm 以避免狂写，可按需改回更保守策略）。
+    """
+    new_pwm = max(0, min(100, int(new_pwm)))
+    if last_pwm is not None and abs(new_pwm - last_pwm) < PWM_WRITE_DELTA:
+        return last_pwm
+    write_ec(port_fd, reg, new_pwm)
+    return new_pwm
 
 
 def main():
     port_fd = os.open('/dev/port', os.O_RDWR)
     print("Z423 Fan Daemon Started.", flush=True)
 
-    # 只在启动时写一次控制模式（或模式变化时再写）
-    last_ctrl_val = None
+    last_cpu_pwm: Optional[int] = None
+    last_sys_pwm: Optional[int] = None
 
     try:
-        while True:
-            # 1) 控制权寄存器：只在需要时写（启动/模式变化）
-            ctrl_val = calc_ctrl_val()
-            if ctrl_val != last_ctrl_val:
-                write_ec(port_fd, REG_CTRL, ctrl_val)
-                last_ctrl_val = ctrl_val
+        # 启动时仅做一次：参照官方保证 0x59 的 WDG 位
+        ensure_reg59_wdg_set(port_fd)
 
-            # 2) 读取温度
+        while True:
             cpu_t = get_cpu_temp()
             hdd_t = get_max_drive_temp_from_drivetemp()
 
-            # 3) CPU 风扇逻辑
+            # CPU fan
             if CPU_FAN_MODE == 'SW_CURVE':
                 cpu_pwm = calc_pwm(cpu_t, CPU_MIN_TEMP, CPU_MAX_TEMP, CPU_MIN_PWM)
-                write_ec(port_fd, REG_CPU_PWM, cpu_pwm)
-                cpu_info = f"[SW_CURVE: {cpu_pwm:3d}%]"
+                last_cpu_pwm = maybe_write_pwm(port_fd, REG_CPU_PWM, cpu_pwm, last_cpu_pwm)
+                cpu_info = f"[SW_CURVE: {last_cpu_pwm:3d}%]"
             elif CPU_FAN_MODE == 'SW_FIXED':
                 cpu_pwm = CPU_FIXED_PWM
-                write_ec(port_fd, REG_CPU_PWM, cpu_pwm)
-                cpu_info = f"[SW_FIXED: {cpu_pwm:3d}%]"
+                last_cpu_pwm = maybe_write_pwm(port_fd, REG_CPU_PWM, cpu_pwm, last_cpu_pwm)
+                cpu_info = f"[SW_FIXED: {last_cpu_pwm:3d}%]"
             else:
-                cpu_pwm = None
-                cpu_info = "[HW_AUTO:  EC%]"
+                cpu_info = "[HW_AUTO:  (no pwm writes)]"
 
-            # 4) 机箱/硬盘风扇逻辑
+            # SYS fan (use drive temp)
             if SYS_FAN_MODE == 'SW_CURVE':
                 sys_pwm = calc_pwm(hdd_t, SYS_MIN_TEMP, SYS_MAX_TEMP, SYS_MIN_PWM)
-                write_ec(port_fd, REG_SYS_PWM, sys_pwm)
-                sys_info = f"[SW_CURVE: {sys_pwm:3d}%]"
+                last_sys_pwm = maybe_write_pwm(port_fd, REG_SYS_PWM, sys_pwm, last_sys_pwm)
+                sys_info = f"[SW_CURVE: {last_sys_pwm:3d}%]"
             elif SYS_FAN_MODE == 'SW_FIXED':
                 sys_pwm = SYS_FIXED_PWM
-                write_ec(port_fd, REG_SYS_PWM, sys_pwm)
-                sys_info = f"[SW_FIXED: {sys_pwm:3d}%]"
+                last_sys_pwm = maybe_write_pwm(port_fd, REG_SYS_PWM, sys_pwm, last_sys_pwm)
+                sys_info = f"[SW_FIXED: {last_sys_pwm:3d}%]"
             else:
-                sys_pwm = None
-                sys_info = "[HW_AUTO:  EC%]"
+                sys_info = "[HW_AUTO:  (no pwm writes)]"
 
-            # 5) 读取真实转速
             cpu_rpm = get_fan_rpm(port_fd, REG_CPU_RPM_H, REG_CPU_RPM_L)
             sys_rpm = get_fan_rpm(port_fd, REG_SYS_RPM_H, REG_SYS_RPM_L)
 
@@ -259,15 +274,17 @@ def main():
                 flush=True
             )
 
-            time.sleep(10)
+            time.sleep(MAIN_INTERVAL_SEC)
 
     except KeyboardInterrupt:
         pass
     finally:
-        # 安全退出：恢复原厂纯硬件控制
-        write_ec(port_fd, REG_CTRL, BIT_WDG | BIT_CPU_AUTO | BIT_SYS_AUTO)
+        # 退出时也只做“参照官方”的最小动作：保证 WDG 位仍置位（不做其它猜测）
+        # 如果你希望退出时恢复“原厂风扇策略”，应该由原厂服务接管。
+        ensure_reg59_wdg_set(port_fd)
+
         os.close(port_fd)
-        print("Daemon Stopped. Full Control returned to EC Hardware.", flush=True)
+        print("Daemon Stopped.", flush=True)
 
 
 if __name__ == '__main__':
