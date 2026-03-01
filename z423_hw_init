@@ -38,11 +38,11 @@ write_ec() {
   sleep_cmd 0.05
 }
 
-klog "Fan Control: write 0x59=0x0b"
+klog "Move EC Control to Linux"
 write_ec "0x59" "0x0b"
 sleep_cmd 1
 
-klog "SATA Control: write 0x58=0xff"
+klog "Setup Disks"
 write_ec "0x58" "0xff"
 sleep_cmd 5
 
