@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 极空间 Z423 硬盘指示灯守护进程
+# 极空间 Z423 硬盘指示灯守护进程（整合：锁文件不 truncate + 锁超时防卡死）
 
 import time
 import os
@@ -44,50 +44,74 @@ LED_MIX_FX_2 = 0x23            # 红灯特效2 + 黄绿特效2
 SMARTCTL_TIMEOUT = 3
 ZPOOL_TIMEOUT = 3
 
+# EC 互斥锁（与风扇等脚本共用）
+LOCK_FILE = '/tmp/z423_ec_port.lock'
+LOCK_TIMEOUT_SEC = 2.0
+LOCK_RETRY_SLEEP = 0.01
+
+
+def _acquire_ec_lock():
+    start = time.time()
+    f_lock = open(LOCK_FILE, 'a')  # 不 truncate，避免频繁元数据写入
+    while True:
+        try:
+            fcntl.flock(f_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f_lock
+        except BlockingIOError:
+            if time.time() - start >= LOCK_TIMEOUT_SEC:
+                f_lock.close()
+                raise TimeoutError("EC lock timeout")
+            time.sleep(LOCK_RETRY_SLEEP)
+
+
+def _release_ec_lock(f_lock):
+    try:
+        fcntl.flock(f_lock, fcntl.LOCK_UN)
+    finally:
+        f_lock.close()
+
 
 def read_ec(fd, addr):
     """读取 EC 寄存器的实际值（失败返回 -1）"""
-    lock_file = '/tmp/z423_ec_port.lock'
     try:
-        with open(lock_file, 'w') as f_lock:
-            fcntl.flock(f_lock, fcntl.LOCK_EX)
-            try:
-                os.lseek(fd, PORT_CMD, os.SEEK_SET)
-                os.write(fd, b'\x80')  # EC read
-                time.sleep(0.005)
-                os.lseek(fd, PORT_DAT, os.SEEK_SET)
-                os.write(fd, bytes([addr]))
-                time.sleep(0.005)
-                os.lseek(fd, PORT_DAT, os.SEEK_SET)
-                val = os.read(fd, 1)
-                return val[0] if val else -1
-            finally:
-                fcntl.flock(f_lock, fcntl.LOCK_UN)
+        f_lock = _acquire_ec_lock()
     except Exception:
         return -1
+    try:
+        os.lseek(fd, PORT_CMD, os.SEEK_SET)
+        os.write(fd, b'\x80')  # EC read
+        time.sleep(0.005)
+        os.lseek(fd, PORT_DAT, os.SEEK_SET)
+        os.write(fd, bytes([addr & 0xFF]))
+        time.sleep(0.005)
+        os.lseek(fd, PORT_DAT, os.SEEK_SET)
+        val = os.read(fd, 1)
+        return val[0] if val else -1
+    except Exception:
+        return -1
+    finally:
+        _release_ec_lock(f_lock)
 
 
 def write_ec(fd, addr, val):
-    lock_file = '/tmp/z423_ec_port.lock'
     try:
-        # 申请排他锁，如果风扇脚本正在用，这里会自动等待，绝不撞车
-        with open(lock_file, 'w') as f_lock:
-            fcntl.flock(f_lock, fcntl.LOCK_EX)
-            try:
-                os.lseek(fd, PORT_CMD, os.SEEK_SET)
-                os.write(fd, b'\x81')
-                time.sleep(0.005)
-                os.lseek(fd, PORT_DAT, os.SEEK_SET)
-                os.write(fd, bytes([addr]))
-                time.sleep(0.005)
-                os.lseek(fd, PORT_DAT, os.SEEK_SET)
-                os.write(fd, bytes([val]))
-                time.sleep(0.005)
-            finally:
-                # 硬件操作完成，释放锁
-                fcntl.flock(f_lock, fcntl.LOCK_UN)
+        f_lock = _acquire_ec_lock()
+    except Exception:
+        return
+    try:
+        os.lseek(fd, PORT_CMD, os.SEEK_SET)
+        os.write(fd, b'\x81')
+        time.sleep(0.005)
+        os.lseek(fd, PORT_DAT, os.SEEK_SET)
+        os.write(fd, bytes([addr & 0xFF]))
+        time.sleep(0.005)
+        os.lseek(fd, PORT_DAT, os.SEEK_SET)
+        os.write(fd, bytes([val & 0xFF]))
+        time.sleep(0.005)
     except Exception:
         pass
+    finally:
+        _release_ec_lock(f_lock)
 
 
 def get_dynamic_disk_map():
