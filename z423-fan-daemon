@@ -285,7 +285,7 @@ def main() -> None:
                 st.last_cpu_pwm = maybe_write_pwm(port_fd, REG_CPU_PWM, CPU_FIXED_PWM, st.last_cpu_pwm)
                 cpu_info = f"[SW_FIXED: {st.last_cpu_pwm:3d}%]"
             else:
-                cpu_info = "[HW_AUTO:  (no pwm writes)]"
+                cpu_info = "[HW_AUTO]"
 
             # SYS fan
             if SYS_FAN_MODE == "SW_CURVE":
@@ -296,7 +296,7 @@ def main() -> None:
                 st.last_sys_pwm = maybe_write_pwm(port_fd, REG_SYS_PWM, SYS_FIXED_PWM, st.last_sys_pwm)
                 sys_info = f"[SW_FIXED: {st.last_sys_pwm:3d}%]"
             else:
-                sys_info = "[HW_AUTO:  (no pwm writes)]"
+                sys_info = "[HW_AUTO]"
 
             if ENABLE_RPM_READ:
                 cpu_rpm = get_fan_rpm(port_fd, REG_CPU_RPM_H, REG_CPU_RPM_L)
