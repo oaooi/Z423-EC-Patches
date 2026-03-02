@@ -25,7 +25,7 @@ from typing import Optional
 
 
 # ===================== 配置 =====================
-CPU_FAN_MODE = "SW_CURVE"  # 'HW_AUTO' | 'SW_CURVE' | 'SW_FIXED'
+CPU_FAN_MODE = "HW_AUTO"  # 'HW_AUTO' | 'SW_CURVE' | 'SW_FIXED'
 SYS_FAN_MODE = "SW_CURVE"  # 'HW_AUTO' | 'SW_CURVE' | 'SW_FIXED'
 
 CPU_MIN_TEMP = 45
