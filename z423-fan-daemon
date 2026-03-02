@@ -38,11 +38,11 @@ SYS_MAX_TEMP = 45
 SYS_MIN_PWM = 25
 SYS_FIXED_PWM = 40
 
-MAIN_INTERVAL_SEC = 10
-PWM_WRITE_DELTA = 2
+MAIN_INTERVAL_SEC = 60
+PWM_WRITE_DELTA = 3
 
 # 设为 False 可进一步减少 EC 读操作（如果你怀疑“读 RPM 也会扰动”）
-ENABLE_RPM_READ = False
+ENABLE_RPM_READ = True
 
 
 # ===================== EC 寄存器/端口 =====================
