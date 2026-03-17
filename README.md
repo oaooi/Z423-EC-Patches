@@ -3,6 +3,9 @@ Patches ZSpace Z423 for HDDs Fans LEDs to function well. No kernel module needed
 
 Tested on Z423, for other devices use it at your own risk.
 
+BIOS Setting:
+Change first boot option to  debian(fnOS), disable ubuntu(stock) boot option.
+
 # Usage
 1. Enter root environment
 ```bash
